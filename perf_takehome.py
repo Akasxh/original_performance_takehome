@@ -350,9 +350,7 @@ class KernelBuilder:
         s_tmp = self.alloc_scratch("s_tmp")
         s_tmp2 = self.alloc_scratch("s_tmp2")
         s_forest_values_p = self.alloc_scratch("forest_values_p")
-        s_inp_indices_p = self.alloc_scratch("inp_indices_p")
         s_inp_values_p = self.alloc_scratch("inp_values_p")
-        s_n_nodes = self.alloc_scratch("n_nodes")
 
         # Vector value storage (persistent across rounds)
         val_vecs = []
@@ -400,7 +398,6 @@ class KernelBuilder:
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
-        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
 
         # Hash constant vectors
         hash_consts = []  # 6 constant vectors for hash stages
@@ -453,6 +450,16 @@ class KernelBuilder:
         for i in range(16):  # enough for depth 4 (16 candidates at most)
             vsel_temps.append(self.alloc_scratch(f"vsel_t{i}", VLEN))
 
+        # Precomputed gather bases for all deep round depths.
+        # These are computed ONCE in prologue (self-staging: const → alu, no s_tmp).
+        # Eliminates 2 per-round ops AND removes s_tmp from the hot path of deep rounds,
+        # which allows better round-boundary scheduling.
+        s_gather_bases = {}
+        for d in range(max_cache_depth + 1, forest_height + 1):
+            gb = self.alloc_scratch(f"gb_{d}")
+            s_gather_bases[d] = gb
+        s_gather_base = self.alloc_scratch("gather_base")  # fallback, unused below
+
         # ===== PROLOGUE: Load constants and initial data =====
         ops = []  # list of (engine, slot, read_addrs, write_addrs)
 
@@ -461,11 +468,10 @@ class KernelBuilder:
             """Add raw instruction (one slot per cycle for now, will pack later)"""
             ops.append((engine, slot))
 
-        # Load memory header values - use 4 independent scalar temps (gather_addrs[0..3])
-        # to break serialization through s_tmp. All 4 const+load pairs can overlap.
+        # Load memory header values - use independent scalar temps to break s_tmp chain.
+        # Only need forest_values_p and inp_values_p (indices not stored back).
         for hi, (mem_off, dest) in enumerate([
-            (4, s_forest_values_p), (5, s_inp_indices_p),
-            (6, s_inp_values_p), (1, s_n_nodes)
+            (4, s_forest_values_p), (6, s_inp_values_p)
         ]):
             ga = gather_addr_sets[0][hi]  # independent temp per header load
             emit("load", ("const", ga, mem_off))
@@ -480,7 +486,6 @@ class KernelBuilder:
         emit("valu", ("vbroadcast", v_zero, sc_zero))
         emit("valu", ("vbroadcast", v_one, sc_one))
         emit("valu", ("vbroadcast", v_two, sc_two))
-        emit("valu", ("vbroadcast", v_n_nodes, s_n_nodes))
 
         # Load and broadcast hash/mult/shift constants: use self-staging to break
         # the s_tmp serialization chain. Load const directly to first element of
@@ -525,6 +530,13 @@ class KernelBuilder:
             emit("alu", ("+", ga, s_forest_values_p, ga))
             emit("load", ("load", ga, ga))
             emit("valu", ("vbroadcast", tree_cache[node_idx], ga))
+
+        # Precompute all gather bases in prologue (self-staging, no s_tmp needed).
+        # forest_values_p is available after header load. Each gb_d is independent.
+        for d, gb in s_gather_bases.items():
+            level_start = (1 << d) - 1
+            emit("load", ("const", gb, level_start))
+            emit("alu", ("+", gb, s_forest_values_p, gb))
 
         # Pause for debug harness
         emit("flow", ("pause",))
@@ -576,9 +588,6 @@ class KernelBuilder:
                     else:
                         new_current.append(current[p])
                 current = new_current
-
-        # Scratch for base address per deep round (forest_values_p + level_start)
-        s_gather_base = self.alloc_scratch("gather_base")
 
         def emit_gather(chunk_idx, dest_vec, gather_set=0):
             """Gather tree values for arbitrary indices (deep levels).
@@ -640,10 +649,8 @@ class KernelBuilder:
             after_wrap_depth0 = (depth == 0) and (prev_was_wrap or rnd == 0)
 
             if depth > max_cache_depth:
-                # DEEP ROUND: compute gather base for this level
-                level_start = (1 << depth) - 1
-                emit("load", ("const", s_tmp, level_start))
-                emit("alu", ("+", s_gather_base, s_forest_values_p, s_tmp))
+                # DEEP ROUND: use precomputed gather base (no per-round s_tmp usage)
+                s_gb = s_gather_bases[depth]
 
                 # Phase 1: All gathers (independent with separate addr sets)
                 for c in range(N_CHUNKS):
@@ -651,7 +658,7 @@ class KernelBuilder:
                     ga = gather_addr_sets[gs]
                     for lane in range(VLEN):
                         src_addr = idx_vecs[c] + lane
-                        emit("alu", ("+", ga[lane], s_gather_base, src_addr))
+                        emit("alu", ("+", ga[lane], s_gb, src_addr))
                     for lane in range(VLEN):
                         emit("load", ("load", node_val_vecs[c] + lane, ga[lane]))
 
@@ -694,10 +701,16 @@ class KernelBuilder:
                         emit_direction_and_update(c, val_vecs[c], ts)
 
         # ===== EPILOGUE: Store values back to memory =====
-        for c in range(N_CHUNKS):
+        # Use s_tmp and s_tmp2 in parallel: 2 const+alu+vstore chains simultaneously
+        # → 2 STORE slots per cycle, halving the epilogue cycles vs single-temp serial.
+        for c in range(0, N_CHUNKS, 2):
+            c2 = c + 1
             emit("load", ("const", s_tmp, c * VLEN))
+            emit("load", ("const", s_tmp2, c2 * VLEN))
             emit("alu", ("+", s_tmp, s_inp_values_p, s_tmp))
+            emit("alu", ("+", s_tmp2, s_inp_values_p, s_tmp2))
             emit("store", ("vstore", s_tmp, val_vecs[c]))
+            emit("store", ("vstore", s_tmp2, val_vecs[c2]))
 
         # Note: indices NOT stored back - submission tests only check values
 
